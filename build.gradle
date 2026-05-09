@@ -1,0 +1,179 @@
+import java.security.MessageDigest
+import java.util.Locale
+
+plugins {
+    id 'java'
+    id 'war'
+}
+
+group = 'com.daisyblog'
+version = '0.1.0-SNAPSHOT'
+
+def wicketVersion = '10.9.0'
+def tomeeVersion = '10.1.5'
+def tomeeArchiveName = "apache-tomee-${tomeeVersion}-plus.zip"
+def tomeeArchiveFile = file("vendor/${tomeeArchiveName}")
+def tomeeExpectedSha512 = 'ac8ec7ed0b1c9a5f9a0d8adb572d22f476d2dafa4ea957708d17076c06a5f3212bcdcc37fd64da7c2bfd0d98b04446d8014f28359f17632ac500376a59435570'
+def tomeeInstallDir = layout.buildDirectory.dir('tomee')
+def tomeeHomeDir = layout.buildDirectory.dir("tomee/apache-tomee-plus-${tomeeVersion}")
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    implementation "org.apache.wicket:wicket-core:${wicketVersion}"
+
+    providedCompile 'jakarta.servlet:jakarta.servlet-api:6.0.0'
+    runtimeOnly 'org.slf4j:slf4j-jdk14:2.0.17'
+
+    testImplementation "org.apache.wicket:wicket-tester:${wicketVersion}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+tasks.named('clean') {
+    delete 'target'
+}
+
+war {
+    archiveFileName = 'portfolio.war'
+    webXml = file('configurations/webapp/WEB-INF/web.xml')
+}
+
+tasks.configureEach {
+    if (name != 'clean') {
+        mustRunAfter tasks.named('clean')
+    }
+}
+
+tasks.register('verifyTomEEZip') {
+    group = 'verification'
+    description = 'Verifies the checked-in TomEE Plus ZIP against Apache SHA-512.'
+    inputs.file(tomeeArchiveFile)
+
+    doLast {
+        if (!tomeeArchiveFile.isFile()) {
+            throw new GradleException("Missing ${tomeeArchiveFile}. Re-download ${tomeeArchiveName} from Apache TomEE.")
+        }
+
+        def actualSha512 = sha512(tomeeArchiveFile)
+        if (!actualSha512.equalsIgnoreCase(tomeeExpectedSha512)) {
+            throw new GradleException("TomEE ZIP checksum mismatch. Expected ${tomeeExpectedSha512}, got ${actualSha512}.")
+        }
+    }
+}
+
+tasks.register('extractTomEE', Copy) {
+    group = 'build setup'
+    description = 'Extracts a fresh TomEE Plus server under build/tomee.'
+    dependsOn tasks.named('verifyTomEEZip')
+    outputs.upToDateWhen { false }
+
+    doFirst {
+        delete(tomeeInstallDir)
+    }
+
+    from zipTree(tomeeArchiveFile)
+    into tomeeInstallDir
+}
+
+tasks.register('overlayTomEEConfig', Copy) {
+    group = 'build setup'
+    description = 'Copies project TomEE configuration files into the extracted server.'
+    dependsOn tasks.named('extractTomEE')
+
+    from 'configurations/tomee'
+    into tomeeHomeDir
+}
+
+tasks.register('deployWar') {
+    group = 'deployment'
+    description = 'Builds the WAR and deploys it to the extracted TomEE server as ROOT.war.'
+    dependsOn tasks.named('war'), tasks.named('overlayTomEEConfig')
+    mustRunAfter tasks.named('test')
+    inputs.file(tasks.named('war').flatMap { it.archiveFile })
+    outputs.file(tomeeHomeDir.map { it.file('webapps/ROOT.war') })
+
+    doLast {
+        def webappsDir = new File(tomeeHomeDir.get().asFile, 'webapps')
+        delete(
+            new File(webappsDir, 'ROOT'),
+            new File(webappsDir, 'ROOT.war'),
+            new File(webappsDir, 'portfolio'),
+            new File(webappsDir, 'portfolio.war')
+        )
+
+        copy {
+            from tasks.named('war').get().archiveFile.get().asFile
+            into webappsDir
+            rename { 'ROOT.war' }
+        }
+    }
+}
+
+tasks.register('runTomEE', Exec) {
+    group = 'application'
+    description = 'Runs the extracted TomEE server with the portfolio app at http://localhost:8080/.'
+    dependsOn tasks.named('deployWar')
+    mustRunAfter tasks.named('test')
+    standardInput = System.in
+
+    doFirst {
+        def homeDir = tomeeHomeDir.get().asFile
+        def script = new File(homeDir, isWindows() ? 'bin/catalina.bat' : 'bin/catalina.sh')
+        if (!script.isFile()) {
+            throw new GradleException("TomEE startup script not found at ${script}.")
+        }
+        if (!isWindows()) {
+            script.setExecutable(true)
+        }
+
+        workingDir homeDir
+        environment 'CATALINA_HOME', homeDir.absolutePath
+        environment 'CATALINA_BASE', homeDir.absolutePath
+        environment 'JAVA_OPTS', "${System.getenv('JAVA_OPTS') ?: ''} -Dfile.encoding=UTF-8".trim()
+
+        if (isWindows()) {
+            commandLine 'cmd', '/c', script.absolutePath, 'run'
+        } else {
+            commandLine script.absolutePath, 'run'
+        }
+    }
+}
+
+tasks.register('FULL_BUILD_AND_RUN') {
+    group = 'application'
+    description = 'Clean, test, build, extract TomEE, deploy the app, and run TomEE.'
+    dependsOn tasks.named('clean'), tasks.named('test'), tasks.named('runTomEE')
+}
+
+tasks.register('fullBuildAndRun') {
+    group = 'application'
+    description = 'Lowercase alias for FULL_BUILD_AND_RUN.'
+    dependsOn tasks.named('FULL_BUILD_AND_RUN')
+}
+
+String sha512(File file) {
+    def digest = MessageDigest.getInstance('SHA-512')
+    file.withInputStream { input ->
+        byte[] buffer = new byte[8192]
+        for (int read = input.read(buffer); read != -1; read = input.read(buffer)) {
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().collect { String.format('%02x', it & 0xff) }.join()
+}
+
+boolean isWindows() {
+    return System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+}
