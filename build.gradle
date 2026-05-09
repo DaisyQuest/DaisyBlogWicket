@@ -43,7 +43,18 @@ tasks.withType(Test).configureEach {
     useJUnitPlatform()
 }
 
+tasks.register('stopTomEE') {
+    group = 'application'
+    description = 'Stops any TomEE process launched from this project build.'
+    outputs.upToDateWhen { false }
+
+    doLast {
+        stopTomEEProcesses(tomeeHomeDir.get().asFile, rootDir, rootProject.name, tomeeVersion)
+    }
+}
+
 tasks.named('clean') {
+    dependsOn tasks.named('stopTomEE')
     delete 'target'
 }
 
@@ -53,7 +64,7 @@ war {
 }
 
 tasks.configureEach {
-    if (name != 'clean') {
+    if (name != 'clean' && name != 'stopTomEE') {
         mustRunAfter tasks.named('clean')
     }
 }
@@ -78,7 +89,7 @@ tasks.register('verifyTomEEZip') {
 tasks.register('extractTomEE', Copy) {
     group = 'build setup'
     description = 'Extracts a fresh TomEE Plus server under build/tomee.'
-    dependsOn tasks.named('verifyTomEEZip')
+    dependsOn tasks.named('stopTomEE'), tasks.named('verifyTomEEZip')
     outputs.upToDateWhen { false }
 
     doFirst {
@@ -204,6 +215,9 @@ tasks.register('runTomEE', Exec) {
         def javaHome = javaRuntimeHome.name.equalsIgnoreCase('jre') ? javaRuntimeHome.parentFile : javaRuntimeHome
         def javaBin = new File(javaRuntimeHome, 'bin')
         def script = new File(homeDir, isWindows() ? 'bin/catalina.bat' : 'bin/catalina.sh')
+        stopTomEEProcesses(homeDir, rootDir, rootProject.name, tomeeVersion)
+        assertPortAvailable(8080)
+
         if (!script.isFile()) {
             throw new GradleException("TomEE startup script not found at ${script}.")
         }
@@ -248,6 +262,208 @@ String sha512(File file) {
         }
     }
     return digest.digest().collect { String.format('%02x', it & 0xff) }.join()
+}
+
+void stopTomEEProcesses(File homeDir, File projectRoot, String projectName, String version) {
+    if (isWindows()) {
+        stopTomEEProcessesWindows(homeDir, projectRoot, projectName, version)
+        return
+    }
+
+    stopTomEEProcessesWithJava(homeDir, projectRoot, projectName, version)
+}
+
+void stopTomEEProcessesWindows(File homeDir, File projectRoot, String projectName, String version) {
+    def script = """
+        \$homeDir = ${powerShellQuote(homeDir.absolutePath)}
+        \$projectRoot = ${powerShellQuote(projectRoot.absolutePath)}
+        \$projectName = ${powerShellQuote(projectName)}
+        \$version = ${powerShellQuote(version)}
+
+        function Normalize([string]\$value) {
+            return \$value.Replace('\\\\', '/').ToLowerInvariant()
+        }
+
+        \$homePath = Normalize \$homeDir
+        \$root = Normalize \$projectRoot
+        \$name = Normalize \$projectName
+        \$tomeeDir = 'apache-tomee-plus-' + \$version
+        \$projectBuildTomEE = Normalize ('build/tomee/' + \$tomeeDir)
+
+        function Get-TomEEProcesses {
+            Get-CimInstance Win32_Process | Where-Object {
+                if (\$_.ProcessId -eq \$PID) {
+                    return \$false
+                }
+                if (-not \$_.CommandLine) {
+                    return \$false
+                }
+
+                \$command = Normalize \$_.CommandLine
+                \$isTomEE = \$command.Contains('org.apache.catalina.startup.bootstrap') -or
+                    \$command.Contains('openejb-javaagent.jar') -or
+                    \$command.Contains('/bin/catalina.sh') -or
+                    \$command.Contains('/bin/catalina.bat')
+
+                \$isThisProject = \$command.Contains(\$homePath) -or
+                    (\$command.Contains(\$root) -and \$command.Contains(\$tomeeDir)) -or
+                    (\$command.Contains(\$name) -and \$command.Contains(\$projectBuildTomEE))
+
+                return \$isTomEE -and \$isThisProject
+            }
+        }
+
+        \$matches = @(Get-TomEEProcesses)
+        if (\$matches.Count -eq 0) {
+            exit 0
+        }
+
+        Write-Output ('Stopping existing TomEE process tree: ' + (\$matches.ProcessId -join ', '))
+        foreach (\$match in \$matches) {
+            & taskkill.exe /PID \$match.ProcessId /T /F | Out-Null
+        }
+
+        Start-Sleep -Seconds 2
+        \$survivors = @(Get-TomEEProcesses)
+        if (\$survivors.Count -gt 0) {
+            Write-Error ('Unable to stop TomEE process(es): ' + (\$survivors.ProcessId -join ', '))
+            exit 1
+        }
+    """.stripIndent()
+
+    def process = new ProcessBuilder('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script)
+        .redirectErrorStream(true)
+        .start()
+    def output = process.inputStream.getText('UTF-8').trim()
+    def exitCode = process.waitFor()
+
+    if (!output.isBlank()) {
+        println output
+    }
+    if (exitCode != 0) {
+        throw new GradleException("Failed to stop existing TomEE process tree.")
+    }
+}
+
+void stopTomEEProcessesWithJava(File homeDir, File projectRoot, String projectName, String version) {
+    def processes = findTomEEProcesses(homeDir, projectRoot, projectName, version)
+    if (processes.isEmpty()) {
+        return
+    }
+
+    println "Stopping existing TomEE process tree: ${describeProcesses(processes)}"
+    terminateProcesses(processes)
+
+    def survivors = findTomEEProcesses(homeDir, projectRoot, projectName, version)
+    if (!survivors.isEmpty()) {
+        throw new GradleException("Unable to stop TomEE process(es): ${describeProcesses(survivors)}")
+    }
+}
+
+String powerShellQuote(String value) {
+    return "'${value.replace("'", "''")}'"
+}
+
+List<ProcessHandle> findTomEEProcesses(File homeDir, File projectRoot, String projectName, String version) {
+    def current = ProcessHandle.current()
+    def protectedPids = ([current.pid()] + ancestorProcesses(current).collect { process -> process.pid() }) as Set
+
+    return ProcessHandle.allProcesses()
+        .filter { process -> process.isAlive() && !protectedPids.contains(process.pid()) }
+        .filter { process -> matchesTomEEProcess(process, homeDir, projectRoot, projectName, version) }
+        .toList()
+}
+
+boolean matchesTomEEProcess(ProcessHandle process, File homeDir, File projectRoot, String projectName, String version) {
+    def commandLine = process.info().commandLine().orElse('')
+    if (commandLine.isBlank()) {
+        return false
+    }
+
+    def command = normalizeProcessText(commandLine)
+    def home = normalizeProcessText(homeDir.absolutePath)
+    def root = normalizeProcessText(projectRoot.absolutePath)
+    def name = normalizeProcessText(projectName)
+    def tomeeDir = "apache-tomee-plus-${version}".toLowerCase(Locale.ROOT)
+    def projectBuildTomEE = normalizeProcessText("build/tomee/${tomeeDir}")
+
+    def isTomEE = command.contains('org.apache.catalina.startup.bootstrap') ||
+        command.contains('openejb-javaagent.jar') ||
+        command.contains('/bin/catalina.sh') ||
+        command.contains('/bin/catalina.bat')
+
+    def isThisProject = command.contains(home) ||
+        (command.contains(root) && command.contains(tomeeDir)) ||
+        (command.contains(name) && command.contains(projectBuildTomEE))
+
+    return isTomEE && isThisProject
+}
+
+void terminateProcesses(Collection<ProcessHandle> roots) {
+    def current = ProcessHandle.current()
+    def protectedPids = ([current.pid()] + ancestorProcesses(current).collect { process -> process.pid() }) as Set
+    def processes = roots
+        .collectMany { process -> ([process] + process.descendants().toList()) }
+        .findAll { process -> process.isAlive() && !protectedPids.contains(process.pid()) }
+        .unique { process -> process.pid() }
+        .sort { left, right -> processDepth(right) <=> processDepth(left) }
+
+    processes.each { process -> process.destroy() }
+    waitForExit(processes, 8000)
+    processes.findAll { process -> process.isAlive() }.each { process -> process.destroyForcibly() }
+    waitForExit(processes, 8000)
+}
+
+void waitForExit(Collection<ProcessHandle> processes, long timeoutMillis) {
+    def deadline = System.currentTimeMillis() + timeoutMillis
+    while (System.currentTimeMillis() < deadline && processes.any { process -> process.isAlive() }) {
+        sleep(200)
+    }
+}
+
+int processDepth(ProcessHandle process) {
+    int depth = 0
+    def parent = process.parent()
+    while (parent.isPresent()) {
+        depth++
+        parent = parent.get().parent()
+    }
+    return depth
+}
+
+List<ProcessHandle> ancestorProcesses(ProcessHandle process) {
+    def ancestors = []
+    def parent = process.parent()
+    while (parent.isPresent()) {
+        ancestors.add(parent.get())
+        parent = parent.get().parent()
+    }
+    return ancestors
+}
+
+String describeProcesses(Collection<ProcessHandle> processes) {
+    return processes
+        .collect { process -> "${process.pid()} ${process.info().commandLine().orElse(process.info().command().orElse('unknown'))}" }
+        .join('; ')
+}
+
+String normalizeProcessText(String value) {
+    return value.replace('\\', '/').toLowerCase(Locale.ROOT)
+}
+
+void assertPortAvailable(int port) {
+    java.net.ServerSocket socket = null
+    try {
+        socket = new java.net.ServerSocket()
+        socket.reuseAddress = false
+        socket.bind(new java.net.InetSocketAddress('0.0.0.0', port))
+    } catch (IOException ex) {
+        throw new GradleException("Port ${port} is still in use after stopping project TomEE. Stop the process using that port and rerun the task.", ex)
+    } finally {
+        if (socket != null) {
+            socket.close()
+        }
+    }
 }
 
 boolean isWindows() {
