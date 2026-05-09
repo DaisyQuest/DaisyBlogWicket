@@ -16,6 +16,8 @@ def tomeeArchiveFile = file("vendor/${tomeeArchiveName}")
 def tomeeExpectedSha512 = 'ac8ec7ed0b1c9a5f9a0d8adb572d22f476d2dafa4ea957708d17076c06a5f3212bcdcc37fd64da7c2bfd0d98b04446d8014f28359f17632ac500376a59435570'
 def tomeeInstallDir = layout.buildDirectory.dir('tomee')
 def tomeeHomeDir = layout.buildDirectory.dir("tomee/apache-tomee-plus-${tomeeVersion}")
+def azurePackageDir = layout.buildDirectory.dir('azure/package')
+def azureTomeeHomeDir = layout.buildDirectory.dir("azure/package/apache-tomee-plus-${tomeeVersion}")
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -119,6 +121,74 @@ tasks.register('deployWar') {
             rename { 'ROOT.war' }
         }
     }
+}
+
+tasks.register('extractAzureTomEE', Copy) {
+    group = 'deployment'
+    description = 'Extracts a fresh TomEE Plus server for the Azure deployment package.'
+    dependsOn tasks.named('verifyTomEEZip')
+    outputs.upToDateWhen { false }
+
+    doFirst {
+        delete(azurePackageDir)
+    }
+
+    from zipTree(tomeeArchiveFile)
+    into azurePackageDir
+}
+
+tasks.register('overlayAzureTomEEConfig', Copy) {
+    group = 'deployment'
+    description = 'Copies project TomEE configuration files into the Azure TomEE package.'
+    dependsOn tasks.named('extractAzureTomEE')
+
+    from 'configurations/tomee'
+    into azureTomeeHomeDir
+}
+
+tasks.register('prepareAzureDeployPackage') {
+    group = 'deployment'
+    description = 'Stages TomEE, ROOT.war, and Azure startup files for ZIP deployment.'
+    dependsOn tasks.named('war'), tasks.named('overlayAzureTomEEConfig')
+    mustRunAfter tasks.named('test')
+    inputs.file(tasks.named('war').flatMap { it.archiveFile })
+    inputs.file('scripts/azure/startup.sh')
+    outputs.dir(azurePackageDir)
+
+    doLast {
+        def packageDir = azurePackageDir.get().asFile
+        def webappsDir = new File(azureTomeeHomeDir.get().asFile, 'webapps')
+
+        delete(
+            new File(webappsDir, 'ROOT'),
+            new File(webappsDir, 'ROOT.war'),
+            new File(webappsDir, 'docs'),
+            new File(webappsDir, 'examples'),
+            new File(webappsDir, 'host-manager'),
+            new File(webappsDir, 'manager')
+        )
+
+        copy {
+            from tasks.named('war').get().archiveFile.get().asFile
+            into webappsDir
+            rename { 'ROOT.war' }
+        }
+
+        copy {
+            from 'scripts/azure/startup.sh'
+            into packageDir
+        }
+    }
+}
+
+tasks.register('azureDeployZip', Zip) {
+    group = 'deployment'
+    description = 'Builds the ZIP deployed to Azure App Service Java SE.'
+    dependsOn tasks.named('prepareAzureDeployPackage')
+    archiveFileName = 'daisyblog-azure.zip'
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+
+    from azurePackageDir
 }
 
 tasks.register('runTomEE', Exec) {
