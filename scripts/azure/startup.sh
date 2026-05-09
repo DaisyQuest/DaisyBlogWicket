@@ -10,6 +10,17 @@ if [ ! -d "$TOMEE_HOME" ]; then
     exit 1
 fi
 
+if [ -z "${JAVA_HOME:-}" ]; then
+    JAVA_BIN="$(command -v java || true)"
+    if [ -z "$JAVA_BIN" ]; then
+        echo "java was not found on PATH and JAVA_HOME is not set" >&2
+        exit 1
+    fi
+    JAVA_BIN="$(readlink -f "$JAVA_BIN")"
+    export JAVA_HOME="$(cd "$(dirname "$JAVA_BIN")/.." && pwd)"
+fi
+
+export JRE_HOME="${JRE_HOME:-$JAVA_HOME}"
 chmod +x "$TOMEE_HOME"/bin/*.sh || true
 
 sed -i "s/port=\"8080\" protocol=\"HTTP\\/1.1\"/port=\"$HTTP_PORT\" protocol=\"HTTP\\/1.1\"/" "$TOMEE_HOME/conf/server.xml"

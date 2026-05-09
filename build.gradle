@@ -200,6 +200,9 @@ tasks.register('runTomEE', Exec) {
 
     doFirst {
         def homeDir = tomeeHomeDir.get().asFile
+        def javaRuntimeHome = new File(System.getProperty('java.home')).absoluteFile
+        def javaHome = javaRuntimeHome.name.equalsIgnoreCase('jre') ? javaRuntimeHome.parentFile : javaRuntimeHome
+        def javaBin = new File(javaRuntimeHome, 'bin')
         def script = new File(homeDir, isWindows() ? 'bin/catalina.bat' : 'bin/catalina.sh')
         if (!script.isFile()) {
             throw new GradleException("TomEE startup script not found at ${script}.")
@@ -211,6 +214,9 @@ tasks.register('runTomEE', Exec) {
         workingDir homeDir
         environment 'CATALINA_HOME', homeDir.absolutePath
         environment 'CATALINA_BASE', homeDir.absolutePath
+        environment 'JAVA_HOME', javaHome.absolutePath
+        environment 'JRE_HOME', javaRuntimeHome.absolutePath
+        environment 'PATH', "${javaBin.absolutePath}${File.pathSeparator}${System.getenv('PATH') ?: ''}"
         environment 'JAVA_OPTS', "${System.getenv('JAVA_OPTS') ?: ''} -Dfile.encoding=UTF-8".trim()
 
         if (isWindows()) {
