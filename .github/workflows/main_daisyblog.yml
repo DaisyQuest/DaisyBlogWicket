@@ -1,7 +1,4 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-
-name: Build and deploy JAR app to Azure Web App - daisyblog
+name: Build and deploy Wicket WAR to Azure Web App - daisyblog
 
 on:
   push:
@@ -13,41 +10,48 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Java version
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'microsoft'
 
-      - name: Build with Maven
-        run: mvn clean install
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Upload artifact for deployment job
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew clean test verifyTomEEZip deployWar --no-daemon
+
+      - name: Upload WAR artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
-          name: java-app
-          path: '${{ github.workspace }}/target/*.jar'
+          name: portfolio-war
+          path: build/libs/portfolio.war
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
-      
+
     steps:
-      - name: Download artifact from build job
+      - name: Download WAR artifact from build job
         uses: actions/download-artifact@v4
         with:
-          name: java-app
-      
+          name: portfolio-war
+
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'daisyblog'
           slot-name: 'Production'
-          package: '*.jar'
+          package: portfolio.war
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2C5EFB5B211841E5ADCC8DC9F61863A6 }}
